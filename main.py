@@ -1097,46 +1097,13 @@ if __name__ == "__main__":
 # In[ ]:
 
 
-@@
 
 
-# In[11]:
+
+# In[ ]:
 
 
-You want three daily monitors.
-SOB_LAB_SERV
-You want to watch this page.
-https://www.ontario.ca/page/ohip-schedule-benefits-and-fees
-You want two RSS outputs for this alarm.
-One feed says no change.  - only discord
-One feed says change detected.
-You want both feeds posted to Discord each day so you know it runs.
-You want the first run to save baseline copies in Supabase so you have a benchmark.
-You also want to watch this specific PDF.
-https://www.ontario.ca/files/2024-01/moh-ohip-schedule-of-benefits-optometry-services-2024-01-24.pdf
-If Ontario removes this file, or replaces it with a new file that has a new date in the filename, you want the alarm to trigger.
-When it triggers, you want an alert message that includes what changed, using file name and date as proof.
-After a trigger, you want an OpenAI step.
-It compares the baseline PDF to the new PDF and produces a change report PDF.
-The report must follow your strict lab focused format, including before and after text for changed sections.
-OHIP_PHS_Fee_Sche_Master
-You want to watch this fee schedule master text file.
-https://www.ontario.ca/files/2025-10/moh-ohip-fee-schedule-master-text-2025-10-03.txt
-If Ontario removes it or posts a new version with a new date in the filename, you want the alarm to trigger.
-You want the first run to save a baseline copy in Supabase.
-You do not want OpenAI for this file.
-You only want a diff style output showing what lines were added or removed, and you want that summary in the RSS and Discord alert.
-You also want to save the layout header PDF as reference.
-https://wayback.archive-it.org/16312/20220505184913/https://health.gov.on.ca/en/pro/programs/ohip/sob/schedule_master/fsm_layout.pdf
-SOB_PHY_SER
-You want to watch these three PDFs.
-https://www.ontario.ca/files/2026-01/moh-schedule-benefit-2025-01-02.pdf
-https://www.ontario.ca/files/2025-04/moh-method-implementation-2025-26-ffs-compensation-increases-en-2025-04-17.pdf
-https://wayback.archive-it.org/16312/20220505184900/https://health.gov.on.ca/en/pro/programs/ohip/sob/physserv/pdf/amendments_diagnostics.pdf
-You want the first run to save baseline copies in Supabase.
-If any file gets removed, or a new dated replacement appears, you want the alarm to trigger.
-When it triggers, you want before and after reporting saved as a PDF, plus an RSS and Discord alert saying change detected, with file names and dates as proof.
-You want OpenAI used for the PDF text comparison reports on these PDFs
+
 
 
 # In[ ]:
