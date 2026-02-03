@@ -1,0 +1,31 @@
+
+"C:\Users\Blues\1 lifelabs SOB\
+
+
+Feb 3. 
+Alarm_SOB_V1.ipynb
+
+
+
+Required
+ SUPABASE_URL
+ SUPABASE_SERVICE_ROLE_KEY
+ SUPABASE_BUCKET, set to alarms or your bucket name
+
+
+DISCORD_WEBHOOK_NO_CHANGE_URL
+DISCORD_WEBHOOK_CHANGE_URL
+
+Optional
+ OPENAI_API_KEY, required only for the PDF compare alarms
+ OPENAI_MODEL, default gpt-4o-mini
+ HTTP_TIMEOUT, default 60
+ DEBUG, set 1 or 0
+ RESET_BASELINE_ON_CHANGE, set 1 or 0
+Value 0
+ Baseline stays fixed.
+ If the file stays changed, you keep getting change alerts every run.
+Value 1
+ After the script processes a change, it copies current into baseline for the affected file.
+ Next run treats the new version as the benchmark.
+ You stop getting repeated alerts for the same change.
