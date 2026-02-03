@@ -22,11 +22,32 @@
 # In[12]:
 
 
+# main.py
+# OHIP alarms runner
+# Local baseline + change detection + Lovable feed post + Discord alerts
+# No Supabase keys needed.
+#
+# Required Railway vars:
+#   FEED_POST_URL=https://tcgdugdhwtbyeygdqdob.supabase.co/functions/v1/feed
+#   FEED_FUNCTION_KEY=...
+#
+# Optional vars:
+#   DATA_DIR=/data
+#   DISCORD_WEBHOOK_URL=...
+#   DISCORD_WEBHOOK_NO_CHANGE_URL=...
+#   DISCORD_WEBHOOK_CHANGE_URL=...
+#   OPENAI_API_KEY=...
+#   OPENAI_MODEL=gpt-4o-mini
+#   HTTP_TIMEOUT=60
+#   DEBUG=1
+#   RESET_BASELINE_ON_CHANGE=0
+#   FORCE_RESET_BASELINE=0
+#   IGNORE_EVENT_TYPES=page_error,baseline_forced_reset
+
 import os
 import re
 import io
 import json
-import time
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,6 +68,9 @@ except Exception:
     canvas = None
 
 
+# -------------------------
+# CONSTANT URLS
+# -------------------------
 OHIP_PAGE_URL = "https://www.ontario.ca/page/ohip-schedule-benefits-and-fees"
 
 SOB_LAB_SERV_PDF = "https://www.ontario.ca/files/2024-01/moh-ohip-schedule-of-benefits-optometry-services-2024-01-24.pdf"
@@ -59,6 +83,9 @@ SOB_PHY_SER_PDF_2 = "https://www.ontario.ca/files/2025-04/moh-method-implementat
 SOB_PHY_SER_PDF_3 = "https://wayback.archive-it.org/16312/20220505184900/https://health.gov.on.ca/en/pro/programs/ohip/sob/physserv/pdf/amendments_diagnostics.pdf"
 
 
+# -------------------------
+# ALARMS
+# -------------------------
 ALARM_DEFS = {
     "SOB_LAB_SERV": {
         "page_url": OHIP_PAGE_URL,
@@ -101,7 +128,11 @@ ALARM_DEFS = {
 }
 
 
+# -------------------------
+# ENV
+# -------------------------
 DATA_DIR = (os.getenv("DATA_DIR") or "/data").strip()
+
 FEED_POST_URL = (os.getenv("FEED_POST_URL") or "").strip()
 FEED_FUNCTION_KEY = (os.getenv("FEED_FUNCTION_KEY") or "").strip()
 
@@ -122,6 +153,9 @@ IGNORE_EVENT_TYPES_RAW = (os.getenv("IGNORE_EVENT_TYPES") or "").strip()
 IGNORE_EVENT_TYPES = set([x.strip() for x in IGNORE_EVENT_TYPES_RAW.split(",") if x.strip()])
 
 
+# -------------------------
+# TIME + LOG
+# -------------------------
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -136,6 +170,9 @@ def log(msg: str) -> None:
         print(f"[{now_utc_iso()}] {msg}", flush=True)
 
 
+# -------------------------
+# HELPERS
+# -------------------------
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
@@ -169,7 +206,9 @@ def read_file_bytes(path: str) -> Optional[bytes]:
 
 
 def write_file_bytes(path: str, b: bytes) -> None:
-    ensure_dir(os.path.dirname(path))
+    folder = os.path.dirname(path)
+    if folder:
+        ensure_dir(folder)
     with open(path, "wb") as f:
         f.write(b)
 
@@ -183,11 +222,16 @@ def read_file_json(path: str) -> Optional[Dict]:
 
 
 def write_file_json(path: str, obj: Dict) -> None:
-    ensure_dir(os.path.dirname(path))
+    folder = os.path.dirname(path)
+    if folder:
+        ensure_dir(folder)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
+# -------------------------
+# HTTP
+# -------------------------
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": "OntarioAlarmMonitor/1.0", "Accept": "*/*"})
@@ -206,14 +250,13 @@ def http_get(url: str) -> Tuple[int, Dict[str, str], bytes, str]:
     return status, hdrs, body, final_url
 
 
+# -------------------------
+# DISCORD
+# -------------------------
 def pick_discord_url(is_change: bool) -> str:
     if is_change:
-        if DISCORD_WEBHOOK_CHANGE_URL != "":
-            return DISCORD_WEBHOOK_CHANGE_URL
-        return DISCORD_WEBHOOK_URL
-    if DISCORD_WEBHOOK_NO_CHANGE_URL != "":
-        return DISCORD_WEBHOOK_NO_CHANGE_URL
-    return DISCORD_WEBHOOK_URL
+        return DISCORD_WEBHOOK_CHANGE_URL or DISCORD_WEBHOOK_URL
+    return DISCORD_WEBHOOK_NO_CHANGE_URL or DISCORD_WEBHOOK_URL
 
 
 def post_discord(msg: str, is_change: bool) -> None:
@@ -226,6 +269,9 @@ def post_discord(msg: str, is_change: bool) -> None:
         log(f"Discord post failed: {e}")
 
 
+# -------------------------
+# RSS
+# -------------------------
 def build_rss(channel_title: str, channel_desc: str, channel_link: str, items: List[Dict[str, str]]) -> str:
     parts: List[str] = []
     parts.append('<?xml version="1.0" encoding="UTF-8"?>')
@@ -248,6 +294,9 @@ def build_rss(channel_title: str, channel_desc: str, channel_link: str, items: L
     return "\n".join(parts)
 
 
+# -------------------------
+# PDF TEXT + PDF REPORT RENDER
+# -------------------------
 def render_pdf(title: str, body_text: str) -> bytes:
     if letter is None or canvas is None:
         return (title + "\n\n" + body_text).encode("utf-8", errors="ignore")
@@ -299,14 +348,15 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     return "\n".join(out)
 
 
+# -------------------------
+# PAGE DISCOVERY
+# -------------------------
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 
 def date_token_from_filename(name: str) -> str:
     m = DATE_RE.search(name)
-    if m is None:
-        return ""
-    return m.group(1)
+    return m.group(1) if m else ""
 
 
 def normalize_page_signal(html_bytes: bytes) -> str:
@@ -355,6 +405,9 @@ def discover_new_file_from_page(page_signal: str, prefix: str, ext: str) -> Opti
     return candidates[-1][0]
 
 
+# -------------------------
+# FETCH MODEL
+# -------------------------
 @dataclass
 class FetchResult:
     url: str
@@ -372,14 +425,9 @@ def expected_content_ok(file_type: str, content_type: str) -> bool:
     if file_type == "pdf":
         return "pdf" in ct
     if file_type == "txt":
-        ok1 = "text" in ct
-        ok2 = "octet-stream" in ct
-        ok3 = "plain" in ct
-        return ok1 or ok2 or ok3
+        return ("text" in ct) or ("octet-stream" in ct) or ("plain" in ct)
     if file_type == "html":
-        ok1 = "html" in ct
-        ok2 = "text" in ct
-        return ok1 or ok2
+        return ("html" in ct) or ("text" in ct)
     return True
 
 
@@ -414,6 +462,9 @@ def meta(fr: FetchResult) -> Dict[str, str]:
     }
 
 
+# -------------------------
+# IGNORE RULES
+# -------------------------
 def ignore_match(ignore_rules: Dict, alarm: str, event: Dict) -> bool:
     et = event.get("event_type") or ""
     if et in IGNORE_EVENT_TYPES:
@@ -457,6 +508,9 @@ def load_ignore_rules_local() -> Dict:
     return obj
 
 
+# -------------------------
+# LOCAL PATHS
+# -------------------------
 def alarm_dir(alarm: str) -> str:
     return os.path.join(DATA_DIR, "alarms", alarm)
 
@@ -469,10 +523,24 @@ def bytes_path(alarm: str, which: str, name: str) -> str:
     return os.path.join(alarm_dir(alarm), which, name)
 
 
+def stable_blob_name(key: str, ftype: str) -> str:
+    ext = "bin"
+    if ftype == "pdf":
+        ext = "pdf"
+    if ftype == "txt":
+        ext = "txt"
+    return f"{key}.{ext}"
+
+
+# -------------------------
+# STATE
+# -------------------------
 def ensure_state_local(alarm: str, alarm_def: Dict) -> Dict:
     p = state_path(alarm)
     st = read_file_json(p)
     if st is not None:
+        st.setdefault("active_urls", {})
+        st.setdefault("baseline", {})
         return st
 
     st = {
@@ -502,46 +570,34 @@ def save_event_local(alarm: str, event: Dict) -> str:
     return path
 
 
-def stable_blob_name(key: str, ftype: str) -> str:
-    ext = "bin"
-    if ftype == "pdf":
-        ext = "pdf"
-    if ftype == "txt":
-        ext = "txt"
-    return f"{key}.{ext}"
-
-
+# -------------------------
+# LOVABLE FEED POST
+# -------------------------
 def post_to_lovable_feed(items: List[Dict]) -> bool:
-    if FEED_POST_URL == "":
-        return False
-    if FEED_FUNCTION_KEY == "":
+    if FEED_POST_URL == "" or FEED_FUNCTION_KEY == "":
         return False
 
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {FEED_FUNCTION_KEY}",
         "apikey": FEED_FUNCTION_KEY,
+        "X-Feed-Function-Key": FEED_FUNCTION_KEY,
     }
 
     try:
         r1 = SESSION.post(FEED_POST_URL, headers=headers, json=items, timeout=60)
         if r1.status_code < 300:
             return True
+        log(f"Feed post status {r1.status_code}: {r1.text[:400]}")
     except Exception as e:
-        log(f"Feed post attempt 1 failed: {e}")
+        log(f"Feed post failed: {e}")
 
-    try:
-        payload = {"items": items}
-        r2 = SESSION.post(FEED_POST_URL, headers=headers, json=payload, timeout=60)
-        if r2.status_code < 300:
-            return True
-        log(f"Feed post status {r2.status_code}: {r2.text[:400]}")
-        return False
-    except Exception as e:
-        log(f"Feed post attempt 2 failed: {e}")
-        return False
+    return False
 
 
+# -------------------------
+# OPENAI PDF REPORT
+# -------------------------
 def openai_pdf_report(alarm_name: str, old_pdf: bytes, new_pdf: bytes, before_name: str, after_name: str) -> str:
     if OPENAI_API_KEY == "":
         return "OpenAI key missing. AI report skipped."
@@ -553,48 +609,27 @@ def openai_pdf_report(alarm_name: str, old_pdf: bytes, new_pdf: bytes, before_na
         "Compare two PDFs. Old PDF is baseline. New PDF is candidate update.\n\n"
         "OUTPUT FORMAT. STRICT.\n"
         "Title\n"
-        "OHIP Schedule of Benefits. Laboratory Services. Change Detection Report\n\n"
-        "SECTION A. EXECUTIVE RESULT. ONE SCREEN.\n"
+        "Change Detection Report\n\n"
+        "SECTION A. EXECUTIVE RESULT.\n"
         "Fee changes detected: YES or NO\n"
         "L-codes added or removed: YES or NO\n"
         "Ordering or eligibility rule changes: YES or NO\n"
         "Signature or requisition rule changes: YES or NO\n"
-        "Administrative or wording only changes: YES or NO\n"
-        "If every answer equals NO except administrative, say:\n"
-        "No laboratory billing or operational impact.\n\n"
-        "SECTION B. FEE TABLE. MACHINE CHECK.\n"
-        "Method\n"
-        "Extract every L-code and dollar value from both PDFs.\n"
-        "Sort by L-code.\n"
-        "Compare old vs new.\n"
-        "Output rules\n"
-        "If zero changes, output exactly:\n"
-        "No L-code or dollar value changes detected. Fee table identical.\n"
-        "If changes exist, output table rows only for differences:\n"
-        "Before\n"
-        "L123 $12.34\n"
-        "After\n"
-        "L123 $14.56\n"
-        "Impact\n"
-        "Increase of $2.22\n"
-        "No filler.\n\n"
-        "SECTION C. NON-FEE SECTIONS THAT CHANGED. EXACT.\n"
-        "For each changed section only:\n"
-        "Section identifier\n"
-        "Before exact paragraph text from old.\n"
-        "After exact paragraph text from new.\n"
-        "Change summary short sentence with real effect on a laboratory.\n\n"
-        "SECTION D. LAB IMPACT FILTER.\n"
-        "Explicitly classify each change:\n"
-        "Financial impact: Yes or No\n"
-        "Workflow impact: Yes or No\n"
-        "Compliance or audit impact: Yes or No\n\n"
-        "SECTION E. DATE AND FILE METADATA.\n"
-        "Before PDF file name and file date.\n"
-        "After PDF file name and file date.\n"
-        "Change statement document updated on [date].\n\n"
-        "SECTION F. FINAL LAB STATEMENT.\n"
-        "One sentence. Mandatory.\n"
+        "Administrative or wording only changes: YES or NO\n\n"
+        "SECTION B. FEE TABLE.\n"
+        "If no changes: No L-code or dollar value changes detected. Fee table identical.\n"
+        "If changes exist, list differences only with Before, After, Impact.\n\n"
+        "SECTION C. OTHER CHANGES.\n"
+        "Show Before paragraph then After paragraph for each changed section.\n\n"
+        "SECTION D. IMPACT FLAGS.\n"
+        "Financial impact Yes or No.\n"
+        "Workflow impact Yes or No.\n"
+        "Compliance impact Yes or No.\n\n"
+        "SECTION E. FILE METADATA.\n"
+        "Before file name and date token.\n"
+        "After file name and date token.\n\n"
+        "SECTION F. FINAL STATEMENT.\n"
+        "One sentence.\n"
     )
 
     payload = {
@@ -618,13 +653,14 @@ def openai_pdf_report(alarm_name: str, old_pdf: bytes, new_pdf: bytes, before_na
             temperature=0,
         )
         txt = (resp.choices[0].message.content or "").strip()
-        if txt == "":
-            return "AI output empty."
-        return txt
+        return txt if txt else "AI output empty."
     except Exception as e:
         return f"OpenAI call failed: {e}"
 
 
+# -------------------------
+# TXT DIFF
+# -------------------------
 def diff_lines(old: str, new: str) -> Dict[str, List[str]]:
     old_set = set(old.splitlines())
     new_set = set(new.splitlines())
@@ -635,48 +671,54 @@ def diff_lines(old: str, new: str) -> Dict[str, List[str]]:
 
 def summarize_txt_diff(old_txt: str, new_txt: str, max_lines: int = 30) -> str:
     d = diff_lines(old_txt, new_txt)
-    added = d["added"][:max_lines]
-    removed = d["removed"][:max_lines]
     parts: List[str] = []
     parts.append(f"Added lines: {len(d['added'])}")
     parts.append(f"Removed lines: {len(d['removed'])}")
-    if len(added) > 0:
+
+    if d["added"]:
         parts.append("Sample added")
-        parts.extend(added)
-    if len(removed) > 0:
+        parts.extend(d["added"][:max_lines])
+
+    if d["removed"]:
         parts.append("Sample removed")
-        parts.extend(removed)
+        parts.extend(d["removed"][:max_lines])
+
     return "\n".join(parts)
 
 
+# -------------------------
+# RUN ONE ALARM
+# -------------------------
 def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
     st = ensure_state_local(alarm, alarm_def)
     run_at = now_utc_iso()
     st["last_run_at"] = run_at
 
+    # ---- page signal and discovery ----
     page_signal = ""
-    if (alarm_def.get("page_url") or "") != "":
-        page_url = alarm_def["page_url"]
+    page_url = alarm_def.get("page_url") or ""
+    if page_url != "":
         fr_page = fetch(page_url)
-        ok_ct = expected_content_ok("html", fr_page.content_type)
-        if fr_page.status >= 400 or ok_ct is False:
-            ev = {
-                "alarm": alarm,
-                "event_type": "page_error",
-                "severity": "HIGH",
-                "when": run_at,
-                "url": page_url,
-                "status": fr_page.status,
-                "content_type": fr_page.content_type,
-                "etag": fr_page.etag,
-                "last_modified": fr_page.last_modified,
-                "sha256": fr_page.sha,
-            }
-            save_event_local(alarm, ev)
+        if fr_page.status >= 400 or expected_content_ok("html", fr_page.content_type) is False:
+            save_event_local(
+                alarm,
+                {
+                    "alarm": alarm,
+                    "event_type": "page_error",
+                    "severity": "HIGH",
+                    "when": run_at,
+                    "url": page_url,
+                    "status": fr_page.status,
+                    "content_type": fr_page.content_type,
+                    "etag": fr_page.etag,
+                    "last_modified": fr_page.last_modified,
+                    "sha256": fr_page.sha,
+                },
+            )
         else:
             page_signal = normalize_page_signal(fr_page.body)
             write_file_bytes(bytes_path(alarm, "current", "page_signal.txt"), page_signal.encode("utf-8"))
-            if (st.get("baseline") or {}).get("page_signal_sha") is None:
+            if st.get("baseline", {}).get("page_signal_sha") is None:
                 st["baseline"]["page_signal_sha"] = sha256_bytes(page_signal.encode("utf-8"))
                 write_file_bytes(bytes_path(alarm, "baseline", "page_signal.txt"), page_signal.encode("utf-8"))
 
@@ -692,7 +734,7 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
             continue
 
         key = d["key"]
-        old_url = st["active_urls"].get(key) or ""
+        old_url = st.get("active_urls", {}).get(key) or ""
 
         if old_url == "":
             st["active_urls"][key] = new_url
@@ -717,6 +759,7 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
 
         changed_name = new_fn != old_fn
         changed_date = (new_token != "") and (new_token != old_token)
+
         if new_url != old_url and (changed_date or changed_name):
             st["active_urls"][key] = new_url
             discovery_events.append(
@@ -736,27 +779,24 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
                 }
             )
 
+    # ---- file checks ----
     file_events: List[Dict] = []
     for wf in alarm_def.get("watch_files", []):
         key = wf["key"]
         ftype = wf["type"]
-        url = st["active_urls"].get(key) or wf["url"]
+        url = st.get("active_urls", {}).get(key) or wf["url"]
         st["active_urls"][key] = url
 
         fr = fetch(url)
         fname = safe_filename_from_url(url)
 
-        ct = fr.content_type or "application/octet-stream"
-        if ftype == "pdf":
-            ct = "application/pdf"
-        if ftype == "txt":
-            ct = "text/plain"
-
+        # Save current evidence
         write_file_bytes(bytes_path(alarm, "current", fname), fr.body)
         write_file_json(bytes_path(alarm, "current", f"{fname}.meta.json"), meta(fr))
 
         stable_curr = stable_blob_name(key, ftype)
         write_file_bytes(bytes_path(alarm, "current", stable_curr), fr.body)
+
         curr_meta = meta(fr)
         curr_meta["source_filename"] = fname
         write_file_json(bytes_path(alarm, "current", f"{key}.meta.json"), curr_meta)
@@ -767,6 +807,7 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
 
         baseline_has = st.get("baseline", {}).get(base_sha_key) is not None
 
+        # Baseline init or forced reset
         if baseline_has is False or FORCE_RESET_BASELINE:
             st["baseline"][base_sha_key] = fr.sha
             st["baseline"][base_meta_key] = curr_meta
@@ -798,8 +839,8 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
         baseline_meta = st["baseline"].get(base_meta_key) or {}
         baseline_fname = st["baseline"].get(base_file_key) or ""
 
-        ok_ct2 = expected_content_ok(ftype, fr.content_type)
-        if fr.status >= 400 or ok_ct2 is False:
+        content_ok = expected_content_ok(ftype, fr.content_type)
+        if fr.status >= 400 or content_ok is False:
             file_events.append(
                 {
                     "alarm": alarm,
@@ -840,11 +881,13 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
                 }
             )
 
+    # Persist state after discovery + current fetch
     write_file_json(state_path(alarm), st)
 
+    # ---- suppression ----
     all_events = discovery_events + file_events
-
     filtered_events: List[Dict] = []
+
     for ev in all_events:
         if ignore_match(ignore_rules, alarm, ev):
             ev["suppressed"] = True
@@ -853,17 +896,20 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
         else:
             filtered_events.append(ev)
 
+    # ---- no change ----
     if len(filtered_events) == 0:
         st["last_no_change_at"] = run_at
         write_file_json(state_path(alarm), st)
         post_discord(f"{alarm} LOW No change. Checked {run_at}", is_change=False)
         return
 
+    # ---- change detected ----
     st["last_change_at"] = run_at
     write_file_json(state_path(alarm), st)
 
     desc_lines: List[str] = []
     event_types: List[str] = []
+
     for ev in filtered_events:
         event_types.append(ev.get("event_type") or "unknown")
         save_event_local(alarm, ev)
@@ -878,40 +924,39 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
                 f"type={et} key={ev.get('key','')} file={ev.get('file','')} status={ev.get('status','')} content_type={ev.get('content_type','')}"
             )
         elif et == "file_hash_changed":
-            b1 = str(ev.get("baseline_sha256",""))[:10]
-            b2 = str(ev.get("new_sha256",""))[:10]
+            b1 = str(ev.get("baseline_sha256", ""))[:10]
+            b2 = str(ev.get("new_sha256", ""))[:10]
             desc_lines.append(f"type={et} key={ev.get('key','')} file={ev.get('file','')} sha={b1} to {b2}")
         elif et == "discovered_url":
             desc_lines.append(f"type={et} key={ev.get('key','')} url={ev.get('new_url','')}")
         else:
             desc_lines.append(f"type={et} file={ev.get('file','')}")
 
+    # ---- reports ----
     report_texts: List[str] = []
 
     if alarm_def.get("ai_reports"):
         for wf in alarm_def.get("watch_files", []):
             if wf.get("reference_only"):
                 continue
-            if wf["type"] != "pdf":
+            if wf.get("type") != "pdf":
                 continue
 
             key = wf["key"]
-            relevant = False
-            for ev in filtered_events:
-                if ev.get("key") == key and ev.get("event_type") in ["new_dated_filename", "file_hash_changed"]:
-                    relevant = True
-            if relevant is False:
-                continue
 
-            missing = False
-            for ev in filtered_events:
-                if ev.get("key") == key and ev.get("event_type") == "file_missing_or_invalid":
-                    missing = True
-            if missing:
+            relevant = any(
+                (ev.get("key") == key and ev.get("event_type") in ["new_dated_filename", "file_hash_changed"])
+                for ev in filtered_events
+            )
+            missing = any(
+                (ev.get("key") == key and ev.get("event_type") == "file_missing_or_invalid") for ev in filtered_events
+            )
+            if not relevant or missing:
                 continue
 
             base_blob = stable_blob_name(key, "pdf")
             curr_blob = stable_blob_name(key, "pdf")
+
             base_bytes = read_file_bytes(bytes_path(alarm, "baseline", base_blob))
             curr_bytes = read_file_bytes(bytes_path(alarm, "current", curr_blob))
             if base_bytes is None or curr_bytes is None:
@@ -930,16 +975,12 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
             write_file_bytes(bytes_path(alarm, "reports", rep_name), pdf_bytes)
 
     if alarm == "OHIP_PHS_Fee_Sche_Master":
-        wf_txt = None
-        for x in alarm_def.get("watch_files", []):
-            if x.get("type") == "txt":
-                wf_txt = x
+        wf_txt = next((x for x in alarm_def.get("watch_files", []) if x.get("type") == "txt"), None)
         if wf_txt is not None:
             key = wf_txt["key"]
-            relevant = False
-            for ev in filtered_events:
-                if ev.get("key") == key and ev.get("event_type") == "file_hash_changed":
-                    relevant = True
+            relevant = any(
+                (ev.get("key") == key and ev.get("event_type") == "file_hash_changed") for ev in filtered_events
+            )
             if relevant:
                 base_blob = stable_blob_name(key, "txt")
                 curr_blob = stable_blob_name(key, "txt")
@@ -956,8 +997,9 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
                     rep_name = f"{ts}_{key}_txt_change_report.pdf"
                     write_file_bytes(bytes_path(alarm, "reports", rep_name), pdf_bytes)
 
+    # ---- rss + feed payload ----
     desc = " | ".join(desc_lines)
-    if len(report_texts) > 0:
+    if report_texts:
         desc = desc + " | AI " + " ".join([t[:600] for t in report_texts])
 
     guid = f"{alarm}:changed:{now_utc_iso()}:{sha256_bytes(desc.encode('utf-8'))[:12]}"
@@ -977,7 +1019,6 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
         channel_link=OHIP_PAGE_URL,
         items=[rss_item],
     )
-
     write_file_bytes(bytes_path(alarm, "feeds", "changed.xml"), rss_xml.encode("utf-8"))
 
     feed_payload_item = {
@@ -993,15 +1034,21 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
     }
 
     posted = post_to_lovable_feed([feed_payload_item])
-
     post_discord(f"{alarm} HIGH Change detected. Feed post ok={posted}", is_change=True)
 
+    # ---- baseline roll forward ----
     if RESET_BASELINE_ON_CHANGE:
-        changed_keys: List[str] = []
-        for ev in filtered_events:
-            if ev.get("event_type") in ["new_dated_filename", "file_hash_changed"] and (ev.get("key") or "") != "":
-                changed_keys.append(ev.get("key"))
-        changed_keys = sorted(list(set(changed_keys)))
+        changed_keys = sorted(
+            list(
+                set(
+                    [
+                        ev.get("key")
+                        for ev in filtered_events
+                        if ev.get("key") and ev.get("event_type") in ["new_dated_filename", "file_hash_changed"]
+                    ]
+                )
+            )
+        )
 
         for wf in alarm_def.get("watch_files", []):
             key = wf["key"]
@@ -1010,17 +1057,17 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
             if wf.get("reference_only"):
                 continue
 
-            miss = False
-            for ev in filtered_events:
-                if ev.get("key") == key and ev.get("event_type") == "file_missing_or_invalid":
-                    miss = True
-            if miss:
+            missing = any(
+                (ev.get("key") == key and ev.get("event_type") == "file_missing_or_invalid") for ev in filtered_events
+            )
+            if missing:
                 continue
 
             ftype = wf["type"]
             curr_blob = stable_blob_name(key, ftype)
             curr_bytes = read_file_bytes(bytes_path(alarm, "current", curr_blob))
             curr_meta = read_file_json(bytes_path(alarm, "current", f"{key}.meta.json")) or {}
+
             if curr_bytes is None:
                 continue
 
@@ -1036,6 +1083,9 @@ def run_alarm(ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
         post_discord(f"{alarm} LOW Baseline reset after change. Keys {','.join(changed_keys)}", is_change=True)
 
 
+# -------------------------
+# MAIN
+# -------------------------
 def main() -> None:
     log("BOOT main reached")
     ensure_dir(DATA_DIR)
@@ -1044,7 +1094,7 @@ def main() -> None:
 
     if FEED_POST_URL == "" or FEED_FUNCTION_KEY == "":
         log("Feed vars missing. Set FEED_POST_URL and FEED_FUNCTION_KEY.")
-        post_discord("Alarm runner started. Feed vars missing.", is_change=True)
+        post_discord("Alarm runner started. Feed vars missing.", is_change=False)
 
     for alarm, alarm_def in ALARM_DEFS.items():
         try:
