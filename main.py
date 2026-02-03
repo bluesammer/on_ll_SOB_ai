@@ -19,17 +19,17 @@
 
 
 
-# In[ ]:
+# In[12]:
 
 
 # main.py
-# OHIP alarms with:
-# - baseline snapshot on first run
-# - change detection gates (new dated filename, hash change, missing or invalid)
-# - changed RSS feed per alarm (Lovable reads later)
-# - two Discord webhooks (no_change heartbeat, change alerts)
-# - RESET_BASELINE_ON_CHANGE to roll baseline forward after a real change
-# - IGNORE_EVENT_TYPES to suppress alert noise by event_type
+# OHIP alarms
+# Baseline snapshot on first run
+# Change detection: new dated filename, hash change, missing or invalid
+# Writes changed-only RSS per alarm for Lovable
+# Two Discord webhooks: no-change heartbeat, change alerts
+# RESET_BASELINE_ON_CHANGE rolls baseline forward after a real change
+# IGNORE_EVENT_TYPES suppresses alert noise by event_type
 
 import os
 import re
@@ -47,8 +47,12 @@ try:
 except Exception:
     pdfplumber = None
 
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+except Exception:
+    letter = None
+    canvas = None
 
 
 # -------------------------
@@ -69,13 +73,14 @@ HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 DEBUG = (os.getenv("DEBUG") or "1").strip() == "1"
 
 RESET_BASELINE_ON_CHANGE = (os.getenv("RESET_BASELINE_ON_CHANGE") or "0").strip() == "1"
+FORCE_RESET_BASELINE = (os.getenv("FORCE_RESET_BASELINE") or "0").strip() == "1"
 
 IGNORE_EVENT_TYPES_RAW = (os.getenv("IGNORE_EVENT_TYPES") or "").strip()
 IGNORE_EVENT_TYPES = set([x.strip() for x in IGNORE_EVENT_TYPES_RAW.split(",") if x.strip()])
 
 
 # -------------------------
-# URLS YOU PROVIDED
+# URLS
 # -------------------------
 OHIP_PAGE_URL = "https://www.ontario.ca/page/ohip-schedule-benefits-and-fees"
 
@@ -135,7 +140,7 @@ ALARM_DEFS = {
 
 
 # -------------------------
-# HELPERS
+# TIME + LOG
 # -------------------------
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -151,6 +156,9 @@ def log(msg: str) -> None:
         print(f"[{now_utc_iso()}] {msg}", flush=True)
 
 
+# -------------------------
+# HASH + SAFE STRINGS
+# -------------------------
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
@@ -171,9 +179,20 @@ def safe_filename_from_url(url: str) -> str:
     return name
 
 
+# -------------------------
+# HTTP
+# -------------------------
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": "OntarioAlarmMonitor/1.0", "Accept": "*/*"})
+    return s
+
+
+SESSION = make_session()
+
+
 def http_get(url: str) -> Tuple[int, Dict[str, str], bytes, str]:
-    headers = {"User-Agent": "OntarioAlarmMonitor/1.0", "Accept": "*/*"}
-    r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
+    r = SESSION.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
     status = r.status_code
     final_url = str(r.url)
     hdrs = {k.lower(): v for k, v in r.headers.items()}
@@ -192,11 +211,14 @@ def post_discord(msg: str, is_change: bool) -> None:
     if not url:
         return
     try:
-        requests.post(url, json={"content": msg}, timeout=30)
+        SESSION.post(url, json={"content": msg}, timeout=30)
     except Exception as e:
         log(f"Discord post failed: {e}")
 
 
+# -------------------------
+# RSS
+# -------------------------
 def build_rss(channel_title: str, channel_desc: str, channel_link: str, items: List[Dict[str, str]]) -> str:
     parts: List[str] = []
     parts.append('<?xml version="1.0" encoding="UTF-8"?>')
@@ -219,7 +241,13 @@ def build_rss(channel_title: str, channel_desc: str, channel_link: str, items: L
     return "\n".join(parts)
 
 
+# -------------------------
+# PDF RENDER
+# -------------------------
 def render_pdf(title: str, body_text: str) -> bytes:
+    if letter is None or canvas is None:
+        return (title + "\n\n" + body_text).encode("utf-8", errors="ignore")
+
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=letter)
     width, height = letter
@@ -265,6 +293,9 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     return "\n".join(out)
 
 
+# -------------------------
+# PAGE DISCOVERY
+# -------------------------
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 
@@ -340,13 +371,13 @@ class SupabaseStorage:
     def upload_bytes(self, path: str, data: bytes, content_type: str) -> None:
         url = f"{self.url}/storage/v1/object/{self.bucket}/{path.lstrip('/')}"
         params = {"upsert": "true"}
-        r = requests.post(url, params=params, headers=self._headers(content_type), data=data, timeout=60)
+        r = SESSION.post(url, params=params, headers=self._headers(content_type), data=data, timeout=60)
         if r.status_code >= 300:
             raise RuntimeError(f"Supabase upload failed {r.status_code}: {r.text}")
 
     def download_bytes(self, path: str) -> Optional[bytes]:
         url = f"{self.url}/storage/v1/object/{self.bucket}/{path.lstrip('/')}"
-        r = requests.get(url, headers=self._headers(), timeout=60)
+        r = SESSION.get(url, headers=self._headers(), timeout=60)
         if r.status_code == 404:
             return None
         if r.status_code >= 300:
@@ -358,7 +389,7 @@ class SupabaseStorage:
 
 
 # -------------------------
-# OPENAI REPORT (PDF ONLY)
+# OPENAI REPORT
 # -------------------------
 def openai_pdf_report(alarm_name: str, old_pdf: bytes, new_pdf: bytes, before_name: str, after_name: str) -> str:
     if not OPENAI_API_KEY:
@@ -453,7 +484,7 @@ Wording only low.
 
 
 # -------------------------
-# IGNORE RULES (JSON IN STORAGE)
+# IGNORE RULES
 # -------------------------
 def load_ignore_rules(s: SupabaseStorage) -> Dict:
     path = "alarms/config/ignore_rules.json"
@@ -481,10 +512,10 @@ def ignore_match(ignore_rules: Dict, alarm: str, event: Dict) -> bool:
         fname_re = r.get("ignore_filename_regex")
         if fname_re:
             try:
-                if not re.search(fname_re, event.get("file") or ""):
+                if re.search(fname_re, event.get("file") or "") is None:
                     continue
             except Exception:
-                pass
+                continue
 
         text_contains = r.get("ignore_text_contains")
         if text_contains:
@@ -510,6 +541,17 @@ class FetchResult:
     content_type: str
     body: bytes
     sha: str
+
+
+def expected_content_ok(file_type: str, content_type: str) -> bool:
+    ct = (content_type or "").lower()
+    if file_type == "pdf":
+        return "pdf" in ct
+    if file_type == "txt":
+        return ("text" in ct) or ("octet-stream" in ct) or ("plain" in ct)
+    if file_type == "html":
+        return ("html" in ct) or ("text" in ct)
+    return True
 
 
 def fetch(url: str) -> FetchResult:
@@ -543,17 +585,6 @@ def meta(fr: FetchResult) -> Dict[str, str]:
     }
 
 
-def expected_content_ok(file_type: str, content_type: str) -> bool:
-    ct = (content_type or "").lower()
-    if file_type == "pdf":
-        return "pdf" in ct
-    if file_type == "txt":
-        return "text" in ct or "octet-stream" in ct
-    if file_type == "html":
-        return "html" in ct or "text" in ct
-    return True
-
-
 # -------------------------
 # STATE + PATHS
 # -------------------------
@@ -570,6 +601,21 @@ def read_json(s: SupabaseStorage, path: str) -> Optional[Dict]:
 
 def write_json(s: SupabaseStorage, path: str, obj: Dict) -> None:
     s.upload_bytes(path, json.dumps(obj, indent=2, ensure_ascii=False).encode("utf-8"), "application/json")
+
+
+def stable_blob_name(key: str, ftype: str) -> str:
+    ext = "bin"
+    if ftype == "pdf":
+        ext = "pdf"
+    if ftype == "txt":
+        ext = "txt"
+    return f"{key}.{ext}"
+
+
+def write_bytes_evidence(s: SupabaseStorage, alarm: str, folder: str, name: str, data: bytes, content_type: str) -> str:
+    path = p_alarm(alarm, f"{folder}/{name}")
+    s.upload_bytes(path, data, content_type)
+    return s.public_url(path)
 
 
 def ensure_state(s: SupabaseStorage, alarm: str, alarm_def: Dict) -> Dict:
@@ -594,21 +640,6 @@ def ensure_state(s: SupabaseStorage, alarm: str, alarm_def: Dict) -> Dict:
 
     write_json(s, state_path, st)
     return st
-
-
-def write_bytes_evidence(s: SupabaseStorage, alarm: str, folder: str, name: str, data: bytes, content_type: str) -> str:
-    path = p_alarm(alarm, f"{folder}/{name}")
-    s.upload_bytes(path, data, content_type)
-    return s.public_url(path)
-
-
-def stable_blob_name(key: str, ftype: str) -> str:
-    ext = "bin"
-    if ftype == "pdf":
-        ext = "pdf"
-    if ftype == "txt":
-        ext = "txt"
-    return f"{key}.{ext}"
 
 
 # -------------------------
@@ -712,6 +743,33 @@ def summarize_txt_diff(old_txt: str, new_txt: str, max_lines: int = 30) -> str:
 
 
 # -------------------------
+# BASELINE RESET HELPERS
+# -------------------------
+def reset_baseline_for_key(
+    s: SupabaseStorage,
+    alarm: str,
+    st: Dict,
+    key: str,
+    ftype: str,
+    curr_bytes: bytes,
+    curr_meta: Dict,
+) -> None:
+    ct = "application/octet-stream"
+    if ftype == "pdf":
+        ct = "application/pdf"
+    if ftype == "txt":
+        ct = "text/plain"
+
+    base_blob = stable_blob_name(key, ftype)
+    s.upload_bytes(p_alarm(alarm, f"baseline/{base_blob}"), curr_bytes, ct)
+    write_json(s, p_alarm(alarm, f"baseline/{key}.meta.json"), curr_meta)
+
+    st["baseline"][f"{key}_sha256"] = sha256_bytes(curr_bytes)
+    st["baseline"][f"{key}_baseline_meta"] = curr_meta
+    st["baseline"][f"{key}_baseline_filename"] = curr_meta.get("source_filename") or base_blob
+
+
+# -------------------------
 # RUN ONE ALARM
 # -------------------------
 def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dict) -> None:
@@ -726,7 +784,7 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
         page_url = alarm_def["page_url"]
         fr_page = fetch(page_url)
 
-        if fr_page.status >= 400 or not expected_content_ok("html", fr_page.content_type):
+        if fr_page.status >= 400 or expected_content_ok("html", fr_page.content_type) is False:
             ev = {
                 "alarm": alarm,
                 "event_type": "page_error",
@@ -751,16 +809,17 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
     for d in alarm_def.get("discover", []):
         if d.get("source") != "page":
             continue
-        if not page_signal:
+        if page_signal == "":
             continue
 
         new_url = discover_new_file_from_page(page_signal, d["prefix"], d["ext"])
-        if not new_url:
+        if new_url is None:
             continue
 
         key = d["key"]
         old_url = st["active_urls"].get(key) or ""
-        if not old_url:
+
+        if old_url == "":
             st["active_urls"][key] = new_url
             discovery_events.append(
                 {
@@ -781,7 +840,7 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
         old_token = date_token_from_filename(old_fn)
         new_token = date_token_from_filename(new_fn)
 
-        if new_url != old_url and ((new_token and new_token != old_token) or (new_fn != old_fn)):
+        if new_url != old_url and ((new_token != "" and new_token != old_token) or (new_fn != old_fn)):
             st["active_urls"][key] = new_url
             discovery_events.append(
                 {
@@ -816,31 +875,47 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
         if ftype == "txt":
             ct = "text/plain"
 
-        # evidence copy by filename
+        # Save current evidence by filename
         write_bytes_evidence(s, alarm, "current", fname, fr.body, ct)
         write_json(s, p_alarm(alarm, f"current/{fname}.meta.json"), meta(fr))
 
-        # stable current blob by key
+        # Save stable current by key
         stable_curr = stable_blob_name(key, ftype)
         s.upload_bytes(p_alarm(alarm, f"current/{stable_curr}"), fr.body, ct)
-        write_json(s, p_alarm(alarm, f"current/{key}.meta.json"), meta(fr) | {"source_filename": fname})
+        curr_meta = meta(fr)
+        curr_meta["source_filename"] = fname
+        write_json(s, p_alarm(alarm, f"current/{key}.meta.json"), curr_meta)
 
         base_sha_key = f"{key}_sha256"
         base_meta_key = f"{key}_baseline_meta"
         base_file_key = f"{key}_baseline_filename"
 
-        # baseline creation
-        if base_sha_key not in st["baseline"]:
+        # Baseline create or forced reset
+        if (base_sha_key not in st["baseline"]) or FORCE_RESET_BASELINE:
             st["baseline"][base_sha_key] = fr.sha
-            st["baseline"][base_meta_key] = meta(fr)
+            st["baseline"][base_meta_key] = curr_meta
             st["baseline"][base_file_key] = fname
 
             stable_base = stable_blob_name(key, ftype)
             s.upload_bytes(p_alarm(alarm, f"baseline/{stable_base}"), fr.body, ct)
-            write_json(s, p_alarm(alarm, f"baseline/{key}.meta.json"), meta(fr) | {"source_filename": fname})
+            write_json(s, p_alarm(alarm, f"baseline/{key}.meta.json"), curr_meta)
 
             write_bytes_evidence(s, alarm, "baseline", fname, fr.body, ct)
-            write_json(s, p_alarm(alarm, f"baseline/{fname}.meta.json"), meta(fr))
+            write_json(s, p_alarm(alarm, f"baseline/{fname}.meta.json"), curr_meta)
+
+            if FORCE_RESET_BASELINE:
+                file_events.append(
+                    {
+                        "alarm": alarm,
+                        "event_type": "baseline_forced_reset",
+                        "severity": "LOW",
+                        "when": run_at,
+                        "key": key,
+                        "url": url,
+                        "file": fname,
+                        "new_sha256": fr.sha,
+                    }
+                )
             continue
 
         baseline_sha = st["baseline"].get(base_sha_key) or ""
@@ -848,7 +923,7 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
         baseline_fname = st["baseline"].get(base_file_key) or ""
 
         content_ok = expected_content_ok(ftype, fr.content_type)
-        if fr.status >= 400 or not content_ok:
+        if fr.status >= 400 or content_ok is False:
             file_events.append(
                 {
                     "alarm": alarm,
@@ -889,6 +964,9 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
                 }
             )
 
+    # Persist state after discovery updates
+    write_json(s, state_path, st)
+
     all_events = discovery_events + file_events
 
     filtered_events: List[Dict] = []
@@ -900,7 +978,7 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
         else:
             filtered_events.append(ev)
 
-    if not filtered_events:
+    if len(filtered_events) == 0:
         st["last_no_change_at"] = run_at
         write_json(s, state_path, st)
         post_discord(f"{alarm} LOW No change. Checked {run_at}", is_change=False)
@@ -929,15 +1007,18 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
             )
         elif et == "file_hash_changed":
             desc_lines.append(
-                f"type={et} key={ev.get('key','')} file={ev.get('file','')} sha={ev.get('baseline_sha256','')[:10]} to {ev.get('new_sha256','')[:10]}"
+                f"type={et} key={ev.get('key','')} file={ev.get('file','')} sha={str(ev.get('baseline_sha256',''))[:10]} to {str(ev.get('new_sha256',''))[:10]}"
             )
         elif et == "discovered_url":
             desc_lines.append(f"type={et} key={ev.get('key','')} url={ev.get('new_url','')}")
+        elif et == "baseline_forced_reset":
+            desc_lines.append(f"type={et} key={ev.get('key','')} file={ev.get('file','')}")
         else:
             desc_lines.append(f"type={et} file={ev.get('file','')}")
 
     report_urls: List[str] = []
 
+    # AI PDF reports
     if alarm_def.get("ai_reports"):
         for wf in alarm_def.get("watch_files", []):
             if wf.get("reference_only"):
@@ -946,11 +1027,17 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
                 continue
 
             key = wf["key"]
-            relevant = any((ev.get("key") == key) and (ev.get("event_type") in ["new_dated_filename", "file_hash_changed"]) for ev in filtered_events)
-            if not relevant:
+            relevant = False
+            for ev in filtered_events:
+                if ev.get("key") == key and ev.get("event_type") in ["new_dated_filename", "file_hash_changed"]:
+                    relevant = True
+            if relevant is False:
                 continue
 
-            missing = any((ev.get("key") == key) and (ev.get("event_type") == "file_missing_or_invalid") for ev in filtered_events)
+            missing = False
+            for ev in filtered_events:
+                if ev.get("key") == key and ev.get("event_type") == "file_missing_or_invalid":
+                    missing = True
             if missing:
                 continue
 
@@ -978,11 +1065,18 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
             rep_url = write_bytes_evidence(s, alarm, "reports", rep_name, pdf_bytes, "application/pdf")
             report_urls.append(rep_url)
 
+    # TXT report for master fee schedule
     if alarm == "OHIP_PHS_Fee_Sche_Master":
-        wf = next((x for x in alarm_def.get("watch_files", []) if x["type"] == "txt"), None)
+        wf = None
+        for x in alarm_def.get("watch_files", []):
+            if x.get("type") == "txt":
+                wf = x
         if wf:
             key = wf["key"]
-            relevant = any((ev.get("key") == key) and (ev.get("event_type") == "file_hash_changed") for ev in filtered_events)
+            relevant = False
+            for ev in filtered_events:
+                if ev.get("key") == key and ev.get("event_type") == "file_hash_changed":
+                    relevant = True
             if relevant:
                 base_blob = stable_blob_name(key, "txt")
                 curr_blob = stable_blob_name(key, "txt")
@@ -999,9 +1093,9 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
                     report_urls.append(rep_url)
 
     desc = " | ".join(desc_lines)
-    if report_urls:
+    if len(report_urls) > 0:
         desc = desc + " | Reports " + " ".join(report_urls)
-    if event_urls:
+    if len(event_urls) > 0:
         desc = desc + " | Events " + " ".join(event_urls)
 
     feed_url = append_changed_feed_item(
@@ -1015,21 +1109,29 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
 
     post_discord(f"{alarm} {severity} Change detected. {feed_url}", is_change=True)
 
-    # baseline roll forward after change
+    # Baseline roll forward after change
     if RESET_BASELINE_ON_CHANGE:
-        changed_keys = sorted(list(set([ev.get("key") for ev in filtered_events if ev.get("event_type") in ["new_dated_filename", "file_hash_changed"] and ev.get("key")])))
+        changed_keys: List[str] = []
+        for ev in filtered_events:
+            if ev.get("event_type") in ["new_dated_filename", "file_hash_changed"] and ev.get("key"):
+                changed_keys.append(ev.get("key"))
+        changed_keys = sorted(list(set(changed_keys)))
+
         for wf in alarm_def.get("watch_files", []):
             key = wf["key"]
             if key not in changed_keys:
                 continue
             if wf.get("reference_only"):
                 continue
-            ftype = wf["type"]
 
-            missing = any((ev.get("key") == key) and (ev.get("event_type") == "file_missing_or_invalid") for ev in filtered_events)
+            missing = False
+            for ev in filtered_events:
+                if ev.get("key") == key and ev.get("event_type") == "file_missing_or_invalid":
+                    missing = True
             if missing:
                 continue
 
+            ftype = wf["type"]
             curr_blob = stable_blob_name(key, ftype)
             curr_bytes = s.download_bytes(p_alarm(alarm, f"current/{curr_blob}"))
             curr_meta = read_json(s, p_alarm(alarm, f"current/{key}.meta.json")) or {}
@@ -1037,26 +1139,16 @@ def run_alarm(s: SupabaseStorage, ignore_rules: Dict, alarm: str, alarm_def: Dic
             if curr_bytes is None:
                 continue
 
-            ct = "application/octet-stream"
-            if ftype == "pdf":
-                ct = "application/pdf"
-            if ftype == "txt":
-                ct = "text/plain"
-
-            base_blob = stable_blob_name(key, ftype)
-            s.upload_bytes(p_alarm(alarm, f"baseline/{base_blob}"), curr_bytes, ct)
-            write_json(s, p_alarm(alarm, f"baseline/{key}.meta.json"), curr_meta)
-
-            st["baseline"][f"{key}_sha256"] = sha256_bytes(curr_bytes)
-            st["baseline"][f"{key}_baseline_meta"] = curr_meta
-            st["baseline"][f"{key}_baseline_filename"] = curr_meta.get("source_filename") or base_blob
+            reset_baseline_for_key(s, alarm, st, key, ftype, curr_bytes, curr_meta)
 
         write_json(s, state_path, st)
         post_discord(f"{alarm} LOW Baseline reset after change. Keys {','.join(changed_keys)}", is_change=True)
 
 
 def main() -> None:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    log("BOOT main() reached")
+
+    if SUPABASE_URL == "" or SUPABASE_SERVICE_ROLE_KEY == "":
         raise RuntimeError("Missing Supabase env vars")
 
     s = SupabaseStorage(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET)
@@ -1071,17 +1163,6 @@ def main() -> None:
             post_discord(msg, is_change=True)
 
     log("Done")
-    log("Railway env vars expected:")
-    log("SUPABASE_URL")
-    log("SUPABASE_SERVICE_ROLE_KEY")
-    log("SUPABASE_BUCKET=alarms")
-    log("DISCORD_WEBHOOK_NO_CHANGE_URL")
-    log("DISCORD_WEBHOOK_CHANGE_URL")
-    log("OPENAI_API_KEY")
-    log("OPENAI_MODEL=gpt-4o-mini")
-    log("RESET_BASELINE_ON_CHANGE=0 or 1")
-    log("IGNORE_EVENT_TYPES=comma list")
-    log("DEBUG=1")
 
 
 if __name__ == "__main__":
